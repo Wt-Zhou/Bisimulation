@@ -1,12 +1,15 @@
 import argparse
-
+import random
+import time
+import os
+import os.path as osp
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from rtree import index as rindex
 from Bisimulation.transition_model import make_transition_model
-
 from Agent.model import dqn_model, bootstrap_model
 from Agent.JunctionTrajectoryPlanner import JunctionTrajectoryPlanner
 from Agent.controller import Controller
@@ -15,59 +18,246 @@ from Agent.actions import LaneAction
 
 class Bisimulation(object):
 
-    def __init__(
-        self,
-        obs_shape,
-        action_shape,
-        device,
-        state_space_dim,
-        transition_model_type,
-        env,
-        hidden_dim=256,
-        discount=0.99,
-        init_temperature=0.01,
-        decoder_lr=0.0005,
-        decoder_weight_lambda=0.0,
-        bisim_coef=0.5
-    ):
-        self.device = device
-        self.discount = discount
-        self.bisim_coef = bisim_coef
-        self.state_space_dim = state_space_dim
-        self.action_shape = action_shape
+    def __init__(self, env):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.args = self.parse_args()
+
         self.env = env
+        self.obs_shape = env.observation_space.shape
+        self.state_space_dim = env.state_space_dim
+        self.action_shape = env.action_space.shape
 
         # Transition Model
-        self.transition_model_type = transition_model_type
         self.transition_model = make_transition_model(
-            transition_model_type, state_space_dim, action_shape
-        ).to(device)
+            self.args.transition_model_type, self.state_space_dim, self.action_shape
+        ).to(self.device)
 
-        # Reward Model
+        # Reward Model - It might calculated from state
         self.reward_decoder = nn.Sequential(
-        nn.Linear(state_space_dim + action_shape[0], 256),
+        nn.Linear(self.state_space_dim + self.action_shape[0], 256),
             nn.ReLU(),
             nn.Linear(256, 128), 
             nn.ReLU(),
-            nn.Linear(128, 1)).to(device)
+            nn.Linear(128, 1)).to(self.device)
 
         self.reward_decoder_optimizer = torch.optim.Adam(
             list(self.reward_decoder.parameters()) + list(self.transition_model.parameters()),
-            lr=decoder_lr,
-            weight_decay=decoder_weight_lambda
+            lr=self.args.decoder_lr,
+            weight_decay=self.args.decoder_weight_lambda
         )
 
         # Q-value
         self.Rtree = RTree()
 
         # Data 
-        self.replay_buffer = ReplayBuffer()
+        self.replay_buffer = ReplayBuffer(self.obs_shape, self.action_shape, self.args.replay_buffer_capacity, self.args.batch_size, self.device)
 
 
-    def train_bisim_NNs(self, env):
+    def parse_args(self):
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--decision_count", type=int, default=1, help="how many steps for a decision")
 
-
+        # environment
+        parser.add_argument('--domain_name', default='carla')
+        parser.add_argument('--task_name', default='run')
+        parser.add_argument('--image_size', default=84, type=int)
+        parser.add_argument('--action_repeat', default=1, type=int)
+        parser.add_argument('--frame_stack', default=1, type=int) #3
+        parser.add_argument('--resource_files', type=str)
+        parser.add_argument('--eval_resource_files', type=str)
+        parser.add_argument('--img_source', default=None, type=str, choices=['color', 'noise', 'images', 'video', 'none'])
+        parser.add_argument('--total_frames', default=1000, type=int)
+        # replay buffer
+        parser.add_argument('--replay_buffer_capacity', default=1000000, type=int)
+        # train
+        parser.add_argument('--agent', default='bisim', type=str, choices=['baseline', 'bisim', 'deepmdp'])
+        parser.add_argument('--init_steps', default=1, type=int)
+        parser.add_argument('--num_train_steps', default=1000, type=int)
+        parser.add_argument('--batch_size', default=1, type=int)
+        parser.add_argument('--hidden_dim', default=256, type=int)
+        parser.add_argument('--k', default=3, type=int, help='number of steps for inverse model')
+        parser.add_argument('--bisim_coef', default=0.5, type=float, help='coefficient for bisim terms')
+        parser.add_argument('--load_encoder', default=None, type=str)
+        # eval
+        parser.add_argument('--eval_freq', default=1000, type=int)  # TODO: master had 10000
+        parser.add_argument('--num_eval_episodes', default=20, type=int)
+        # critic
+        parser.add_argument('--critic_lr', default=1e-3, type=float)
+        parser.add_argument('--critic_beta', default=0.9, type=float)
+        parser.add_argument('--critic_tau', default=0.005, type=float)
+        parser.add_argument('--critic_target_update_freq', default=2, type=int)
+        # actor
+        parser.add_argument('--actor_lr', default=1e-3, type=float)
+        parser.add_argument('--actor_beta', default=0.9, type=float)
+        parser.add_argument('--actor_log_std_min', default=-10, type=float)
+        parser.add_argument('--actor_log_std_max', default=2, type=float)
+        parser.add_argument('--actor_update_freq', default=2, type=int)
+        # encoder/decoder
+        parser.add_argument('--encoder_type', default='pixelCarla098', type=str, choices=['pixel', 'pixelCarla096', 'pixelCarla098', 'identity'])
+        parser.add_argument('--encoder_feature_dim', default=50, type=int)
+        parser.add_argument('--encoder_lr', default=1e-3, type=float)
+        parser.add_argument('--encoder_tau', default=0.005, type=float)
+        parser.add_argument('--encoder_stride', default=1, type=int)
+        parser.add_argument('--decoder_type', default='pixel', type=str, choices=['pixel', 'identity', 'contrastive', 'reward', 'inverse', 'reconstruction'])
+        parser.add_argument('--decoder_lr', default=1e-3, type=float)
+        parser.add_argument('--decoder_update_freq', default=1, type=int)
+        parser.add_argument('--decoder_weight_lambda', default=0.0, type=float)
+        parser.add_argument('--num_layers', default=4, type=int)
+        parser.add_argument('--num_filters', default=32, type=int)
+        # sac
+        parser.add_argument('--discount', default=0.99, type=float)
+        parser.add_argument('--init_temperature', default=0.01, type=float)
+        parser.add_argument('--alpha_lr', default=1e-3, type=float)
+        parser.add_argument('--alpha_beta', default=0.9, type=float)
+        # misc
+        parser.add_argument('--seed', default=1, type=int)
+        parser.add_argument('--work_dir', default='.', type=str)
+        parser.add_argument('--save_tb', default=False, action='store_true')
+        parser.add_argument('--save_model', default=True, action='store_true')
+        parser.add_argument('--save_buffer', default=True, action='store_true')
+        parser.add_argument('--save_video', default=False, action='store_true')
+        parser.add_argument('--transition_model_type', default='probabilistic', type=str, choices=['', 'deterministic', 'probabilistic', 'ensemble'])
+        parser.add_argument('--render', default=False, action='store_true')
+        parser.add_argument('--port', default=2000, type=int)
+        args = parser.parse_args()
+        return args
     
+    def make_dir(self, dir_path):
+        try:
+            os.mkdir(dir_path)
+        except OSError:
+            pass
+        return dir_path
+
+    def train_bisim_NNs(self, train_step, env, load_step, policy): # 1 for random policy, 0 for werling
+        # Init Planner
+        self.trajectory_planner = JunctionTrajectoryPlanner()
+        self.controller = Controller()
+        self.dynamic_map = DynamicMap()
+        self.target_speed = 30/3.6 
+
+        args = self.parse_args()
+        self.make_dir(args.work_dir)
+        model_dir = self.make_dir(os.path.join(args.work_dir, 'model'))
+        buffer_dir = self.make_dir(os.path.join(args.work_dir, 'replay_buffer'))
+
+        # Collected data and train
+        episode, episode_reward, done = 0, 0, True
+        
+        try:
+            self.load(model_dir, load_step)
+            print("[Bisim_Model] : Load learned model successful, step=",load_step)
+            self.replay_buffer.load(buffer_dir)
+            print("[Bisim_Model] : Load Buffer!")
+
+        except:
+            load_step = 0
+            print("[Bisim_Model] : No learned model, Creat new model")
+
+        for step in range(train_step + 1):
+            if done:
+
+                obs = env.reset()
+                done = False
+                episode_reward = 0
+                episode_step = 0
+                episode += 1
+                reward = 0   
+            
+            # save agent periodically
+            if step % args.eval_freq == 0:
+                if args.save_model:
+                    print("[Bisim_Model] : Saved Model! Step:",step + load_step)
+                    self.save(model_dir, step + load_step)
+                if args.save_buffer:
+                    self.replay_buffer.save(buffer_dir)
+                    print("[Bisim_Model] : Saved Buffer!")
+
+            # run training update
+            if step >= args.init_steps:
+                num_updates = args.init_steps if step == args.init_steps else 1
+                for _ in range(num_updates):
+                    self.update(self.replay_buffer, step) # Updated Transition and Reward Module
+
+
+            obs = np.array(obs)
+            curr_reward = reward
+            
+            if policy == 1:
+                action = np.array([(random.random() - 0.5) * 2, (random.random() - 0.5) * 2])
+                new_obs, reward, done, info = env.step(action)
+            else:
+                # Rule-based Planner
+                self.dynamic_map.update_map_from_obs(obs, env)
+                rule_trajectory, high_level_action = self.trajectory_planner.trajectory_update(self.dynamic_map)
+                high_level_action = random.randint(0, 8)
+                print("-------------------",high_level_action)
+                # Control
+                trajectory = self.trajectory_planner.trajectory_update_CP(high_level_action, rule_trajectory)
+                for i in range(args.decision_count):
+                    control_action =  self.controller.get_control(self.dynamic_map,  trajectory.trajectory, trajectory.desired_speed)
+                    action = np.array([control_action.acc, control_action.steering])
+                    new_obs, reward, done, info = env.step(action)
+                    if done:
+                        break
+                    self.dynamic_map.update_map_from_obs(new_obs, env)
+
+            print("Predicted Reward:",self.get_reward_prediction(obs, action))
+            print("Actual Reward:",reward)
+            print("Predicted State:",self.get_trans_prediction(obs, action)[0])
+            print("Actual State:",(new_obs - env.observation_space.low) / (env.observation_space.high - env.observation_space.low))
+            episode_reward += reward
+            normal_new_obs = (new_obs - env.observation_space.low) / (env.observation_space.high - env.observation_space.low)
+            normal_obs = (obs - env.observation_space.low) / (env.observation_space.high - env.observation_space.low)
+            self.replay_buffer.add(normal_obs, action, curr_reward, reward, normal_new_obs, done)
+
+            obs = new_obs
+            episode_step += 1
+
+    def test_Q_bisim(self, env, load_step, test_policy):
+        
+        # Load models
+        args = self.parse_args()
+        self.make_dir(args.work_dir)
+        model_dir = self.make_dir(os.path.join(args.work_dir, 'model'))
+        test_buffer_dir = self.make_dir(os.path.join(args.work_dir, 'test_buffer'))
+        
+        try:
+            self.load(model_dir, load_step)
+            print("[Bisim_Model] : Load learned model and buffer successful, step=",load_step)
+
+        except:
+            load_step = 0
+            print("[Bisim_Model] : No learned model, Creat new model")
+
+        # Test Policy to get Q and states
+        test_buffer = ReplayBuffer(self.obs_shape, self.action_shape, self.args.replay_buffer_capacity, self.args.batch_size, self.device)
+        for step in range(test_step + 1):
+            if done:
+                obs = env.reset()
+                done = False
+                reward = 0   
+
+            obs = np.array(obs)
+            action = test_policy(obs)
+            new_obs, reward, done, info = env.step(action)
+            if done:
+                break
+            obs = new_obs  
+
+            normal_new_obs = (new_obs - env.observation_space.low) / (env.observation_space.high - env.observation_space.low)
+            normal_obs = (obs - env.observation_space.low) / (env.observation_space.high - env.observation_space.low)
+            test_buffer.add(normal_obs, action, reward, reward, normal_new_obs, done)
+        test_buffer.save(test_buffer_dir)
+        print("[Bisim_Model] : Saved Test Buffer")
+        # for experience in replay buffer: all other experience
+        
+        # calculated Q1-Q2,bisim
+        
+        # record to txt:(s1,s2,Q1-Q2,bisim,reward1,reward2,transition1,transition2)
+
+        return 0        
+
     def update_transition_reward_model(self, obs, action, next_obs, reward,  step):
         obs_with_action = torch.cat([obs, action], dim=1)
         pred_next_latent_mu, pred_next_latent_sigma = self.transition_model(obs_with_action)
@@ -96,6 +286,7 @@ class Bisimulation(object):
         total_loss.backward()
         self.reward_decoder_optimizer.step()
 
+        print("debug",loss,reward_loss)
         with open("Reward_loss.txt", 'a') as fw:
             fw.write(str(loss.detach().cpu().numpy())) 
             fw.write(", ")
@@ -103,7 +294,7 @@ class Bisimulation(object):
             fw.write("\n")
             fw.close()    
 
-        print("[World_Model] : Updated all models! Step:",step)
+        print("[Bisim_Model] : Updated all models! Step:",step)
 
     def get_reward_prediction(self, obs, action):
         obs = (obs - self.env.observation_space.low) / (self.env.observation_space.high - self.env.observation_space.low)
@@ -111,9 +302,9 @@ class Bisimulation(object):
         np_obs = np.empty((1, self.state_space_dim), dtype=np.float32)
         np.copyto(np_obs[0], obs)
         obs = torch.as_tensor(np_obs, device=self.device).float()
-        np_action = np.empty((1, 1), dtype=np.float32)
-        np.copyto(np_action[0], action)
-        action = torch.as_tensor(np_action, device=self.device)
+        np_action = np.empty((2), dtype=np.float32)
+        np.copyto(np_action, action)
+        action = torch.as_tensor(np_action, device=self.device).unsqueeze(0)
 
         with torch.no_grad():
             obs_with_action = torch.cat([obs, action], dim=1)
@@ -125,9 +316,10 @@ class Bisimulation(object):
         np_obs = np.empty((1, self.state_space_dim), dtype=np.float32)
         np.copyto(np_obs[0], obs)
         obs = torch.as_tensor(np_obs, device=self.device).float()
-        np_action = np.empty((1, 1), dtype=np.float32)
-        np.copyto(np_action[0], action)
-        action = torch.as_tensor(np_action, device=self.device)
+        np_action = np.empty((2), dtype=np.float32)
+        np.copyto(np_action, action)
+        action = torch.as_tensor(np_action, device=self.device).unsqueeze(0)
+
         with torch.no_grad():
             obs_with_action = torch.cat([obs, action], dim=1)
             return self.transition_model(obs_with_action)
@@ -206,7 +398,6 @@ class Bisimulation(object):
             torch.load('%s/transition_model%s.pt' % (model_dir, step))
         )
 
-
 class RTree(object):
 
     def __init__(self, new_count=True):
@@ -216,19 +407,29 @@ class RTree(object):
             if osp.exists("state_index.dat"):
                 os.remove("state_index.dat")
                 os.remove("state_index.idx")
+            if osp.exists("visited_value.txt"):
+                os.remove("visited_value.txt")
 
             # _setup_data_saving 
+            self.visited_state_value = []
             self.visited_state_counter = 0
         else:
             self.visited_state_value = np.loadtxt("visited_value.txt")
-            self.visited_state_value = self.visited_state_value.tolist()
-            self.visited_state_counter = len(self.visited_state_value) 
+            self.visited_state_value = visited_state_value.tolist()
+            self.visited_state_counter = len(visited_state_value)
             print("Loaded Save Rtree, len:",self.visited_state_counter)
-        obs_dimension = 16
+        
+        self.visited_state_outfile = open("visited_state.txt", "a")
+        self.visited_state_format = " ".join(("%f",)*14)+"\n"
+
+        self.visited_value_outfile = open("visited_value.txt", "a")
+        self.visited_value_format = " ".join(("%f",)*2)+"\n"
+
+        obs_dimension = 20
         self.visited_state_tree_prop = rindex.Property()
         self.visited_state_tree_prop.dimension = obs_dimension+1
-        # self.visited_state_dist = np.array([[1, 1, 0.5, 0.5, 1, 1, 0.5, 0.5,1, 1, 0.5, 0.5,1, 1, 0.5, 0.5, 0.1]])#, 10, 0.3, 3, 1, 0.1]])
-        self.visited_state_dist = np.array([[2, 2, 2.0, 2.0, 5, 5, 2.0, 2.0, 5, 5, 2.0, 2.0, 5, 5, 2.0, 2.0,  0.5]])#, 10, 0.3, 3, 1, 0.1]])
+        self.visited_state_dist = np.array([[1, 1, 0.5, 0.5, 1, 1, 0.5, 0.5,1, 1, 0.5, 0.5,1, 1, 0.5, 0.5, 1, 1, 0.5, 0.5, 0.1]])#, 10, 0.3, 3, 1, 0.1]])
+        # self.visited_state_dist = np.array([[2, 2, 2.0, 2.0, 5, 5, 2.0, 2.0, 5, 5, 2.0, 2.0, 5, 5, 2.0, 2.0,  0.5]])#, 10, 0.3, 3, 1, 0.1]])
         # self.visited_state_dist = np.array([[2, 2, 1.0, 1.0, 5, 5, 2.0, 2.0, 5, 5, 2.0, 2.0, 5, 5, 2.0, 2.0,  0.5]])#, 10, 0.3, 3, 1, 0.1]])
         self.visited_state_tree = rindex.Index('state_index',properties=self.visited_state_tree_prop)
 
@@ -265,6 +466,63 @@ class RTree(object):
         visited_times = sum(1 for _ in self.visited_state_tree.intersection(state_to_count.tolist()))
 
         return visited_times
+
+    def add_data(self, obs, action, rew, new_obs, done):
+        self.trajectory_buffer.append(obs, action, rew, new_obs, done)
+
+        while len(self.trajectory_buffer) > 10:
+            obs_left, action_left, rew_left, new_obs_left, done_left = trajectory_buffer.popleft()
+            state_to_record = self.state_with_action(obs_left, action_left)
+            action_to_record = action_left
+            r_to_record = rew_left
+            if self.save_new_data:
+                self.visited_state_value.append([action_to_record,r_to_record])
+                self.visited_state_tree.insert(self.visited_state_counter,
+                    tuple((state_to_record-self.visited_state_dist).tolist()[0]+(state_to_record+self.visited_state_dist).tolist()[0]))
+                self.visited_state_outfile.write(self.visited_state_format % tuple(state_to_record[0]))
+                self.visited_value_outfile.write(self.visited_value_format % tuple([action_to_record,r_to_record]))
+                self.visited_state_counter += 1
+        
+
+        if done:
+            _, _, rew_right, _, _ = trajectory_buffer[-1]
+            while len(trajectory_buffer)>0:
+                obs_left, action_left, rew_left, new_obs_left, done_left = trajectory_buffer.popleft()
+                action_to_record = action_left
+                r_to_record = rew_right*gamma**len(trajectory_buffer)
+                state_to_record = self.state_with_action(obs_left, action_left)
+                if self.save_new_data:
+                    self.visited_state_value.append([action_to_record,r_to_record])
+                    self.visited_state_tree.insert(self.visited_state_counter,
+                        tuple((state_to_record-self.visited_state_dist).tolist()[0]+(state_to_record+self.visited_state_dist).tolist()[0]))
+                    self.visited_state_outfile.write(self.visited_state_format % tuple(state_to_record[0]))
+                    self.visited_value_outfile.write(self.visited_value_format % tuple([action_to_record,r_to_record]))
+                    self.visited_state_counter += 1
+
+        if self.save_new_driving_data:
+            state_rule = self.state_with_action(obs,0)
+            visited_times_rule = _calculate_visited_times(state_rule,self.visited_state_rule_tree)
+            mean_rule, var_rule, sigma_rule = _calculate_statistics_index(state_rule,self.visited_state_rule_value,self.visited_state_rule_tree)
+            if action == 0:
+                visited_times_RL = -1
+                mean_RL = -1
+                var_RL = -1
+            else:
+                RL_state = self.state_with_action(obs,action)
+                visited_times_RL = _calculate_visited_times(RL_state,self.visited_state_tree)
+                mean_RL, var_RL, sigma_RL = _calculate_statistics_index(RL_state,self.visited_state_value,visited_state_tree)
+
+            record_data = state_rule
+            record_data = np.append(record_data,rew)
+            record_data = np.append(record_data,float(done))
+            record_data = np.append(record_data,visited_times_rule)
+            record_data = np.append(record_data,mean_rule)
+            record_data = np.append(record_data,var_rule)
+            record_data = np.append(record_data,visited_times_RL)
+            record_data = np.append(record_data,mean_RL)
+            record_data = np.append(record_data,var_RL)
+
+            self.driving_record_outfile.write(self.driving_record_format % tuple(record_data))
 
 
 class ReplayBuffer(object):

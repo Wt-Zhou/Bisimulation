@@ -456,7 +456,6 @@ class CarEnv_02_Intersection:
 
     def step(self, action):
         # Control ego vehicle
-        print("action[0]",action[0])
         throttle = max(0,float(action[0]))  # range [0,1]
         brake = max(0,-float(action[0])) # range [0,1]
         steer = action[1] # range [-1,1]
@@ -479,12 +478,12 @@ class CarEnv_02_Intersection:
         
         if self.ego_vehicle_pass():
             done = True
-            reward = 1
+            reward = 0
             print("[CARLA]: Successful!")
 
         elif self.ego_vehicle_stuck():
             self.stuck_num += 1
-            reward = -0.0
+            reward = 0
             done = True
             print("[CARLA]: Stuck!")
 
@@ -528,7 +527,7 @@ class CarEnv_02_Intersection_fixed:
         self.global_routing()
 
         # RL settingss
-        self.action_space = spaces.Discrete(8) # len(fplist + 2) 0 for rule, 1 for brake 
+        self.action_space = spaces.Box(np.array([-1,-1]),np.array([1,1])) # acc, steer 
         self.low  = np.array([133,  198, -2, -2,125, 189, -1, -1,125, 189, -1, -1, 128, 195, -2, -1, 125, 195, -2,-1], dtype=np.float64)
         self.high = np.array([137,  203, 1, 1, 130, 194,  2,  1,130, 194,  2,  1,  132,  200,  1,  2,  130,  200 , 1, 2], dtype=np.float64)    
         # self.low  = np.array([130,  190, -6, -6,120, 189, -1, -1, 120, 185, -5, -1, 120, 185, -5,-1], dtype=np.float64)
@@ -536,6 +535,7 @@ class CarEnv_02_Intersection_fixed:
         # low  = np.array([100,  170, -15, -15,50, 189, -15, -15, 50, 185, -15, -15, 110, 185, -15,-15])
         # high = np.array([150,  220, 15, 15, 155, 194,  15,  15,  150,  205,  15,  15,  190,  205 , 15, 15])    
         self.observation_space = spaces.Box(self.low, self.high, dtype=np.float32)
+        self.state_space_dim = 20
 
         # Spawn Ego Vehicle
         global start_point

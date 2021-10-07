@@ -14,20 +14,20 @@ from Agent.cubic_spline_planner import Spline2D
 MAX_SPEED = 50.0 / 3.6  # maximum speed [m/s]
 MAX_ACCEL = 10.0  # maximum acceleration [m/ss]
 MAX_CURVATURE = 500.0  # maximum curvature [1/m]
-MAX_ROAD_WIDTH = 2.0   # maximum road width [m] # related to RL action space
-D_ROAD_W = 1.99  # road width sampling length [m]
+MAX_ROAD_WIDTH = 8.0   # maximum road width [m] # related to RL action space
+D_ROAD_W = 6.99  # road width sampling length [m]
 DT = 0.3  # time tick [s]
 MAXT = 6.3  # max prediction time [m]
 MINT = 6.0  # min prediction time [m]
-TARGET_SPEED = 30.0 / 3.6  # target speed [m/s]
-D_T_S = 25.0 / 3.6  # target speed sampling length [m/s]
+TARGET_SPEED = 40.0 / 3.6  # target speed [m/s]
+D_T_S = 15.0 / 3.6  # target speed sampling length [m/s]
 N_S_SAMPLE = 1  # sampling number of target speed
 
 # Collision check
 OBSTACLES_CONSIDERED = 4
-ROBOT_RADIUS = 2.0  # robot radius [m]
-RADIUS_SPEED_RATIO = 0.1 # higher speed, bigger circle
-MOVE_GAP = 2.0
+ROBOT_RADIUS = 1  # robot radius [m]
+RADIUS_SPEED_RATIO = 0 # higher speed, bigger circle
+MOVE_GAP = 1
 ONLY_SAMPLE_TO_RIGHT = False
 
 # Cost weights
@@ -82,10 +82,11 @@ class JunctionTrajectoryPlanner(object):
     
     def trajectory_update(self, dynamic_map):
         if self.initialize(dynamic_map):
-            
+            index = 0
+
             start_state = self.calculate_start_state(dynamic_map)
             
-            generated_trajectory = self.frenet_optimal_planning(self.csp, self.c_speed, start_state)
+            generated_trajectory, index = self.frenet_optimal_planning(self.csp, self.c_speed, start_state)
             
             if generated_trajectory is not None:
                 k = min(len(generated_trajectory.s_d),5)-1
@@ -114,26 +115,21 @@ class JunctionTrajectoryPlanner(object):
             trajectory, velocity_trajectory = dense_polyline2d_withvelocity(trajectory_array, np.array(desired_speed), 0.2)
             trajectory_action = TrajectoryAction(trajectory_array, velocity_trajectory)
             # trajectory_action = TrajectoryAction(trajectory_array, self.ref_tail_speed(dynamic_map, velocity_trajectory))
-            return trajectory_action
+            return trajectory_action, index
        
         else:
             return None
 
-
-    def trajectory_update_UBP(self, UBP_action, rule_trajectory):
-        if UBP_action == 0:
-            print("[UBP]:----> Rule-based planning")           
-            return rule_trajectory
-
-        if UBP_action == 1: # brake!
+    def trajectory_update_CP(self, CP_action, rule_trajectory):
+        if CP_action == 0:
+            print("[CP]:----> Brake") 
             generated_trajectory =  self.all_trajectory[0][0]
             trajectory_array = np.c_[generated_trajectory.x, generated_trajectory.y]
             trajectory_action = TrajectoryAction(trajectory_array, [0] * len(trajectory_array))
-            return trajectory_action
-
-        fplist = self.all_trajectory      
-        print("fplist",len(fplist))
-        bestpath = fplist[int(UBP_action - 2)][0]
+            return trajectory_action          
+            
+        fplist = self.all_trajectory  
+        bestpath = fplist[int(CP_action - 1)][0]
         bestpath.s_d
         trajectory_array = np.c_[bestpath.x, bestpath.y]
         
@@ -142,7 +138,7 @@ class JunctionTrajectoryPlanner(object):
         self.last_trajectory_rule = bestpath 
 
         trajectory_action = TrajectoryAction(trajectory_array, bestpath.s_d[:len(trajectory_array)])
-        print("[UBP]: ------> UBP Successful Planning")           
+        print("[CP]: ------> CP Successful Planning")           
         return trajectory_action
 
     def initialize(self, dynamic_map):
@@ -247,30 +243,26 @@ class JunctionTrajectoryPlanner(object):
 
         # sorted fplist with cost
         path_tuples = []
+        i = 0
         for fp in fplist:
-            one_path = [fp, fp.cf]
+            one_path = [fp, fp.cf, i]
+            i = i + 1
             path_tuples.append(one_path)
-
+        self.all_trajectory = path_tuples
         sorted_fplist = sorted(path_tuples, key=lambda path_tuples: path_tuples[1])
         
-        self.all_trajectory = sorted_fplist
+        print("How many action?",len(sorted_fplist))
 
         sorted_fplist = self.check_paths(sorted_fplist)
         t3 = time.time()
         time_consume3 = t3 - t2
         candidate_len3 = len(sorted_fplist)
 
-        # print("[UBP]: Werling time consume step1 %.1f(candidate: %d), step2: %.1f(candidate: %d), step3: %.1f(candidate: %d)"
-        #                                     %(time_consume1, candidate_len1,
-        #                                     time_consume2, candidate_len2,
-        #                                     time_consume3, candidate_len3))
-
-        
-        for fp, score in sorted_fplist:
+        for fp, score, index in sorted_fplist:
             if self.obs_prediction.check_collision(fp):
-                return fp
+                return fp, index + 1 # 0 for brake trajectory
         
-        return None
+        return None,0
 
     def generate_target_course(self, x, y):
         csp = Spline2D(x, y)
