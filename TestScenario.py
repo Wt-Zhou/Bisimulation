@@ -803,7 +803,7 @@ class CarEnv_02_Intersection_fixed:
 
         elif self.ego_vehicle_stuck():
             self.stuck_num += 1
-            reward = -0.0
+            reward = 0
             done = True
             print("[CARLA]: Stuck!")
 

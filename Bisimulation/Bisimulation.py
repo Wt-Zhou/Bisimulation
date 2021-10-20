@@ -8,9 +8,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from collections import deque
 from rtree import index as rindex
 from Bisimulation.transition_model import make_transition_model
-from Agent.model import dqn_model, bootstrap_model
 from Agent.JunctionTrajectoryPlanner import JunctionTrajectoryPlanner
 from Agent.controller import Controller
 from Agent.dynamic_map import DynamicMap
@@ -47,7 +47,7 @@ class Bisimulation(object):
         )
 
         # Q-value
-        self.Rtree = RTree()
+        self.Rtree = RTree(self.args)
 
         # Data 
         self.replay_buffer = ReplayBuffer(self.obs_shape, self.action_shape, self.args.replay_buffer_capacity, self.args.batch_size, self.device)
@@ -214,13 +214,12 @@ class Bisimulation(object):
             obs = new_obs
             episode_step += 1
 
-    def test_Q_bisim(self, env, load_step, test_policy):
+    def test_Q_bisim(self, env, load_step, test_policy, test_step=10000):
         
         # Load models
-        args = self.parse_args()
-        self.make_dir(args.work_dir)
-        model_dir = self.make_dir(os.path.join(args.work_dir, 'model'))
-        test_buffer_dir = self.make_dir(os.path.join(args.work_dir, 'test_buffer'))
+        self.make_dir(self.args.work_dir)
+        model_dir = self.make_dir(os.path.join(self.args.work_dir, 'model'))
+        test_buffer_dir = self.make_dir(os.path.join(self.args.work_dir, 'test_buffer'))
         
         try:
             self.load(model_dir, load_step)
@@ -232,26 +231,30 @@ class Bisimulation(object):
 
         # Test Policy to get Q and states
         test_buffer = ReplayBuffer(self.obs_shape, self.action_shape, self.args.replay_buffer_capacity, self.args.batch_size, self.device)
+        done = True
         for step in range(test_step + 1):
+            print("step",step)
             if done:
                 obs = env.reset()
                 done = False
                 reward = 0   
 
             obs = np.array(obs)
-            action = test_policy(obs)
+            action = test_policy.act(obs)
+            print("visited_times", self.Rtree.calculate_visited_times(obs, action))
+            print("Q_value",self.Rtree.calculate_Q_value(obs, action) )
+
             new_obs, reward, done, info = env.step(action)
-            if done:
-                break
             obs = new_obs  
 
-            normal_new_obs = (new_obs - env.observation_space.low) / (env.observation_space.high - env.observation_space.low)
-            normal_obs = (obs - env.observation_space.low) / (env.observation_space.high - env.observation_space.low)
-            test_buffer.add(normal_obs, action, reward, reward, normal_new_obs, done)
+            test_buffer.add(obs, action, reward, reward, new_obs, done)
+            self.Rtree.add_data_to_rtree(obs, action, reward, new_obs, done)
+
         test_buffer.save(test_buffer_dir)
-        print("[Bisim_Model] : Saved Test Buffer")
+        print("[Bisim_Model] : Finished Test, Saved Test Buffer")
         # for experience in replay buffer: all other experience
-        
+        normal_obs = (obs - env.observation_space.low) / (env.observation_space.high - env.observation_space.low)
+
         # calculated Q1-Q2,bisim
         
         # record to txt:(s1,s2,Q1-Q2,bisim,reward1,reward2,transition1,transition2)
@@ -286,7 +289,7 @@ class Bisimulation(object):
         total_loss.backward()
         self.reward_decoder_optimizer.step()
 
-        print("debug",loss,reward_loss)
+        # print("debug",loss,reward_loss)
         with open("Reward_loss.txt", 'a') as fw:
             fw.write(str(loss.detach().cpu().numpy())) 
             fw.write(", ")
@@ -400,8 +403,8 @@ class Bisimulation(object):
 
 class RTree(object):
 
-    def __init__(self, new_count=True):
-        if new_count == True:
+    def __init__(self, args, new_file=True, save_new_data=True):
+        if new_file:
             if osp.exists("visited_state_value.txt"):
                 os.remove("visited_state_value.txt")
             if osp.exists("state_index.dat"):
@@ -419,46 +422,67 @@ class RTree(object):
             self.visited_state_counter = len(visited_state_value)
             print("Loaded Save Rtree, len:",self.visited_state_counter)
         
+        self.save_new_data = save_new_data
+        self.args = args
+        self.trajectory_buffer = deque(maxlen=20)
+
         self.visited_state_outfile = open("visited_state.txt", "a")
-        self.visited_state_format = " ".join(("%f",)*14)+"\n"
+        self.visited_state_format = " ".join(("%f",)*22)+"\n"
 
         self.visited_value_outfile = open("visited_value.txt", "a")
-        self.visited_value_format = " ".join(("%f",)*2)+"\n"
+        self.visited_value_format = " ".join(("%f",)*3)+"\n"
 
         obs_dimension = 20
         self.visited_state_tree_prop = rindex.Property()
-        self.visited_state_tree_prop.dimension = obs_dimension+1
-        self.visited_state_dist = np.array([[1, 1, 0.5, 0.5, 1, 1, 0.5, 0.5,1, 1, 0.5, 0.5,1, 1, 0.5, 0.5, 1, 1, 0.5, 0.5, 0.1]])#, 10, 0.3, 3, 1, 0.1]])
+        self.visited_state_tree_prop.dimension = obs_dimension+2
+        self.visited_state_dist = np.array([[1, 1, 0.5, 0.5, 1, 1, 0.5, 0.5,1, 1, 0.5, 0.5,1, 1, 0.5, 0.5, 1, 1, 0.5, 0.5, 0.1, 0.1]])#, 10, 0.3, 3, 1, 0.1]])
         # self.visited_state_dist = np.array([[2, 2, 2.0, 2.0, 5, 5, 2.0, 2.0, 5, 5, 2.0, 2.0, 5, 5, 2.0, 2.0,  0.5]])#, 10, 0.3, 3, 1, 0.1]])
         # self.visited_state_dist = np.array([[2, 2, 1.0, 1.0, 5, 5, 2.0, 2.0, 5, 5, 2.0, 2.0, 5, 5, 2.0, 2.0,  0.5]])#, 10, 0.3, 3, 1, 0.1]])
         self.visited_state_tree = rindex.Index('state_index',properties=self.visited_state_tree_prop)
 
         self.visited_value_outfile = open("visited_value.txt", "a")
-        self.visited_value_format = " ".join(("%f",)*2)+"\n"
+        self.visited_value_format = " ".join(("%f",)*3)+"\n"
     
-    def update_with_replay_buffer(self, replay_buffer):
-        print("Start Update Rtree!Len:",len(replay_buffer._storage))
-        j=0
-        for experience in replay_buffer._storage:
-            obs_e, action_e, rew, new_obs, done, masks, train_times = experience
-            for i in range(train_times):
-                state_to_record = np.append(obs_e, action_e)
+    def state_with_action(self,obs,action):
+        return np.append(obs, action)
+   
+    def add_data_to_rtree(self, obs, action, rew, new_obs, done):
+        self.trajectory_buffer.append((obs, action, rew, new_obs, done))
+        while len(self.trajectory_buffer) > 10:
+            obs_left, action_left, rew_left, new_obs_left, done_left = self.trajectory_buffer.popleft()
+            # print("debug111",obs_left)
+            # print("debug111",action_left)
+            # print("debug111",rew_left)
+            state_to_record = self.state_with_action(obs_left, action_left)
+            action_to_record = action_left
+            r_to_record = rew_left
+            if self.save_new_data:
+                self.visited_state_value.append(list([np.append(action_to_record, r_to_record)]))
                 self.visited_state_tree.insert(self.visited_state_counter,
-                            tuple((state_to_record-self.visited_state_dist[0]).tolist()+(state_to_record+self.visited_state_dist[0]).tolist()))
+                    tuple((state_to_record-self.visited_state_dist).tolist()[0]+(state_to_record+self.visited_state_dist).tolist()[0]))
+                # print("debug33",state_to_record)
+                # print("debug33",self.visited_state_format)
+                # print("debug44",np.append(action_to_record, r_to_record))
+                # print("debug44",self.visited_value_format)
+                self.visited_state_outfile.write(self.visited_state_format % tuple(state_to_record))
+                self.visited_value_outfile.write(self.visited_value_format % tuple(np.append(action_to_record, r_to_record)))
                 self.visited_state_counter += 1
-            j += 1
-            print("Updated count:",j)
-        print("Rtree using Train Buffer Updated!,Len:",self.visited_state_counter)
+        
 
-    def add_data_to_rtree(self, training_data):
-        (obses_t, actions, rewards, obses_tp1, dones, masks, weights, batch_idxes, training_time) = training_data
-        for i in range(len(obses_t)):
-            state_to_record = np.append(obses_t[i], actions[i])
-            self.visited_state_tree.insert(self.visited_state_counter,
-                        tuple((state_to_record-self.visited_state_dist[0]).tolist()+(state_to_record+self.visited_state_dist[0]).tolist()))
-
-            self.visited_state_counter += 1
-            self.visited_value_outfile.write(self.visited_value_format % tuple([actions[i],rewards[i]]))
+        if done:
+            _, _, rew_right, _, _ = self.trajectory_buffer[-1]
+            while len(self.trajectory_buffer)>0:
+                obs_left, action_left, rew_left, new_obs_left, done_left = self.trajectory_buffer.popleft()
+                action_to_record = action_left
+                r_to_record = rew_right*self.args.discount**len(self.trajectory_buffer)
+                state_to_record = self.state_with_action(obs_left, action_left)
+                if self.save_new_data:
+                    self.visited_state_value.append(np.append(action_to_record, r_to_record))
+                    self.visited_state_tree.insert(self.visited_state_counter,
+                        tuple((state_to_record-self.visited_state_dist).tolist()[0]+(state_to_record+self.visited_state_dist).tolist()[0]))
+                    self.visited_state_outfile.write(self.visited_state_format % tuple(state_to_record))
+                    self.visited_value_outfile.write(self.visited_value_format % tuple(np.append(action_to_record, r_to_record)))
+                    self.visited_state_counter += 1
 
     def calculate_visited_times(self, obs, action):
         
@@ -466,63 +490,22 @@ class RTree(object):
         visited_times = sum(1 for _ in self.visited_state_tree.intersection(state_to_count.tolist()))
 
         return visited_times
+    
+    def calculate_Q_value(self, obs, action):
 
-    def add_data(self, obs, action, rew, new_obs, done):
-        self.trajectory_buffer.append(obs, action, rew, new_obs, done)
-
-        while len(self.trajectory_buffer) > 10:
-            obs_left, action_left, rew_left, new_obs_left, done_left = trajectory_buffer.popleft()
-            state_to_record = self.state_with_action(obs_left, action_left)
-            action_to_record = action_left
-            r_to_record = rew_left
-            if self.save_new_data:
-                self.visited_state_value.append([action_to_record,r_to_record])
-                self.visited_state_tree.insert(self.visited_state_counter,
-                    tuple((state_to_record-self.visited_state_dist).tolist()[0]+(state_to_record+self.visited_state_dist).tolist()[0]))
-                self.visited_state_outfile.write(self.visited_state_format % tuple(state_to_record[0]))
-                self.visited_value_outfile.write(self.visited_value_format % tuple([action_to_record,r_to_record]))
-                self.visited_state_counter += 1
+        if self.calculate_visited_times(obs, action) == 0:
+            return -1, -1, -1
         
+        state_to_count = np.append(obs, action)
+        value_list = [self.visited_state_value[idx] for idx in self.visited_state_tree.intersection(state_to_count.tolist())]
+        value_array_av = np.array(value_list)
+        value_array = value_array_av[-1] # Not sure, change
 
-        if done:
-            _, _, rew_right, _, _ = trajectory_buffer[-1]
-            while len(trajectory_buffer)>0:
-                obs_left, action_left, rew_left, new_obs_left, done_left = trajectory_buffer.popleft()
-                action_to_record = action_left
-                r_to_record = rew_right*gamma**len(trajectory_buffer)
-                state_to_record = self.state_with_action(obs_left, action_left)
-                if self.save_new_data:
-                    self.visited_state_value.append([action_to_record,r_to_record])
-                    self.visited_state_tree.insert(self.visited_state_counter,
-                        tuple((state_to_record-self.visited_state_dist).tolist()[0]+(state_to_record+self.visited_state_dist).tolist()[0]))
-                    self.visited_state_outfile.write(self.visited_state_format % tuple(state_to_record[0]))
-                    self.visited_value_outfile.write(self.visited_value_format % tuple([action_to_record,r_to_record]))
-                    self.visited_state_counter += 1
+        mean = np.mean(value_array)
+        var = np.var(value_array)
+        sigma = np.sqrt(var)
 
-        if self.save_new_driving_data:
-            state_rule = self.state_with_action(obs,0)
-            visited_times_rule = _calculate_visited_times(state_rule,self.visited_state_rule_tree)
-            mean_rule, var_rule, sigma_rule = _calculate_statistics_index(state_rule,self.visited_state_rule_value,self.visited_state_rule_tree)
-            if action == 0:
-                visited_times_RL = -1
-                mean_RL = -1
-                var_RL = -1
-            else:
-                RL_state = self.state_with_action(obs,action)
-                visited_times_RL = _calculate_visited_times(RL_state,self.visited_state_tree)
-                mean_RL, var_RL, sigma_RL = _calculate_statistics_index(RL_state,self.visited_state_value,visited_state_tree)
-
-            record_data = state_rule
-            record_data = np.append(record_data,rew)
-            record_data = np.append(record_data,float(done))
-            record_data = np.append(record_data,visited_times_rule)
-            record_data = np.append(record_data,mean_rule)
-            record_data = np.append(record_data,var_rule)
-            record_data = np.append(record_data,visited_times_RL)
-            record_data = np.append(record_data,mean_RL)
-            record_data = np.append(record_data,var_RL)
-
-            self.driving_record_outfile.write(self.driving_record_format % tuple(record_data))
+        return mean,var,sigma
 
 
 class ReplayBuffer(object):
