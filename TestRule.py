@@ -62,7 +62,7 @@ if __name__ == '__main__':
         while True:
             obs = np.array(obs)
             dynamic_map.update_map_from_obs(obs, env)
-            rule_trajectory = trajectory_planner.trajectory_update(dynamic_map)
+            rule_trajectory, index = trajectory_planner.trajectory_update(dynamic_map)
 
             for i in range(5):
                 control_action =  controller.get_control(dynamic_map,  rule_trajectory.trajectory, rule_trajectory.desired_speed)
